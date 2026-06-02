@@ -53,6 +53,13 @@ def get_args():
     arg_parser.add_argument('--dyrep', action='store_true', help='Run the DyRep model variant')
     arg_parser.add_argument('--tag', type=int, default=3, help='A general-purpose tag for the model run')
 
+    # THPrompt hyperparameters (Section 4.1-4.3)
+    arg_parser.add_argument('--rank', type=int, default=16, help='Low-rank dimension r for topology prompt (Eq. 4)')
+    arg_parser.add_argument('--n_topo_bases', type=int, default=8, help='Number of topology prompt bases K1 (Eq. 21)')
+    arg_parser.add_argument('--n_his_bases', type=int, default=8, help='Number of history prompt bases K2 (Eq. 22)')
+    arg_parser.add_argument('--self_history_K', type=int, default=5, help='Number of recent self-history states K (Eq. 12)')
+    arg_parser.add_argument('--topo_lambda', type=float, default=0.1, help='Weight lambda for topology loss (Eq. 20)')
+
     try:
         config = arg_parser.parse_args()
         return config

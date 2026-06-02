@@ -9,8 +9,10 @@ from TGN.message_function import get_message_function
 from TGN.memory_updater import get_memory_updater
 from TGN.embedding_module import get_embedding_module
 from TGN.time_encoding import TimeEncode
-from THPrompt import structure_prompt_layer,task_prompt_layer, EdgePromptGenerator
-from collections import OrderedDict
+from THPrompt import TopologyAwarePrompt, HistoryAwarePrompt, TaskPromptLayer
+from utils.prompt_utils import (compute_node_degrees_at_time,
+                                compute_graph_level_features,
+                                compute_avg_degree_at_time)
 import torch.nn as nn
 
 
@@ -25,27 +27,20 @@ class TGN(torch.nn.Module):
                memory_updater_type="gru",
                use_destination_embedding_in_message=False,
                use_source_embedding_in_message=False,
-               dyrep=False,struc_prompt_tag=False,
+               dyrep=False, struc_prompt_tag=False,
                node_feat_dim=None, edge_feat_dim=None,
-               t2_ratio=0.8, t3_ratio=0.5):
+               rank=16, n_topo_bases=8, n_his_bases=8, self_history_K=5,
+               topo_lambda=0.1):
     super(TGN, self).__init__()
     self.struc_prompt_tag = struc_prompt_tag
-    input_dim = edge_features.shape[1]
-    self.prompt = task_prompt_layer(input_dim)
-    
-    if self.struc_prompt_tag:
-      self.struc_prompt = structure_prompt_layer(edge_features.shape[0],input_dim)
-    else:
-      self.struc_prompt = None
 
-    self.node_raw_features = torch.from_numpy(node_features.astype(np.float32)).to(device)         
+    self.node_raw_features = torch.from_numpy(node_features.astype(np.float32)).to(device)
     self.n_layers = n_layers
-    
+
     self.neighbor_finder = neighbor_finder
     self.device = device
     self.logger = logging.getLogger(__name__)
-    
-    
+
     self.edge_raw_features = torch.from_numpy(edge_features.astype(np.float32)).to(device)
 
     self.n_node_features = self.node_raw_features.shape[1]
@@ -57,6 +52,7 @@ class TGN(torch.nn.Module):
     self.use_destination_embedding_in_message = use_destination_embedding_in_message
     self.use_source_embedding_in_message = use_source_embedding_in_message
     self.dyrep = dyrep
+    self.topo_lambda = topo_lambda
 
     self.use_memory = use_memory
     self.time_encoder = TimeEncode(dimension=self.n_node_features)
@@ -66,7 +62,7 @@ class TGN(torch.nn.Module):
     self.std_time_shift_src = std_time_shift_src
     self.mean_time_shift_dst = mean_time_shift_dst
     self.std_time_shift_dst = std_time_shift_dst
-    
+
     if self.use_memory:
       self.memory_dimension = memory_dimension
       self.memory_update_at_start = memory_update_at_start
@@ -91,7 +87,6 @@ class TGN(torch.nn.Module):
 
     self.embedding_module_type = embedding_module_type
 
-
     self.embedding_module = get_embedding_module(node_features=self.node_raw_features,
                                                  edge_features=self.edge_raw_features,
                                                  memory=self.memory,
@@ -103,44 +98,36 @@ class TGN(torch.nn.Module):
                                                  n_time_features=self.n_node_features,
                                                  embedding_dimension=self.embedding_dimension,
                                                  device=self.device,
-                                                 n_heads=n_heads, 
+                                                 n_heads=n_heads,
                                                  dropout=dropout,
                                                  use_memory=use_memory)
 
     self.affinity_score = MergeLayer(self.n_node_features, self.n_node_features,
-                                     self.n_node_features,
-                                     1)
-    self.edge_prompt_generator = EdgePromptGenerator(
-        node_feat_dim=node_feat_dim or self.n_node_features,
-        edge_feat_dim=edge_feat_dim or self.n_edge_features
+                                     self.n_node_features, 1)
+
+    # --- Topology-Aware Generative Prompt ---
+    _node_feat_dim = node_feat_dim or self.n_node_features
+    _edge_feat_dim = edge_feat_dim or self.n_edge_features
+    self.topo_prompt = TopologyAwarePrompt(
+        node_feat_dim=_node_feat_dim,
+        edge_feat_dim=_edge_feat_dim,
+        rank=rank,
+        n_bases=n_topo_bases,
     )
 
-    self.t2_ratio = t2_ratio  # t2 = t1 * t2_ratio
-    self.t3_ratio = t3_ratio  # t3 = t1 * t3_ratio
-    
-    self.node_history = defaultdict(list)  # {node_id: [(timestamp, feature_idx), ...]}
-    self.edge_history = defaultdict(list)  # {node_id: [edge_idx, ...]}
-    self.node_timestamps = defaultdict(list)  
-    self.edge_timestamps = defaultdict(list)  
-    
-    self.node_features_time_varying = False  
+    # --- History-Aware Temporal Context Prompt ---
+    self.history_prompt = HistoryAwarePrompt(
+        node_feat_dim=_node_feat_dim,
+        n_bases=n_his_bases,
+        n_neighbors=n_neighbors or 10,
+        K=self_history_K,
+    )
+
+    # Task prompt layer
+    self.task_prompt = TaskPromptLayer(_edge_feat_dim)
 
   def compute_temporal_embeddings(self, source_nodes, destination_nodes, negative_nodes, edge_times,
                                   edge_idxs, n_neighbors=20):
-    
-    """
-    Compute temporal embeddings for sources, destinations, and negatively sampled destinations.
-
-    source_nodes [batch_size]: source ids.
-    :param destination_nodes [batch_size]: destination ids
-    :param negative_nodes [batch_size]: ids of negative sampled destination
-    :param edge_times [batch_size]: timestamp of interaction
-    :param edge_idxs [batch_size]: index of interaction
-    :param n_neighbors [scalar]: number of temporal neighbor to consider in each convolutional
-    layer
-    :return: Temporal embeddings for sources, destinations and negatives
-    """
-
     n_samples = len(source_nodes)
     nodes = np.concatenate([source_nodes, destination_nodes, negative_nodes])
     positives = np.concatenate([source_nodes, destination_nodes])
@@ -150,15 +137,12 @@ class TGN(torch.nn.Module):
     time_diffs = None
     if self.use_memory:
       if self.memory_update_at_start:
-        # Update memory for all nodes with messages stored in previous batches
         memory, last_update = self.get_updated_memory(list(range(self.n_nodes)),
                                                       self.memory.messages)
       else:
         memory = self.memory.get_memory(list(range(self.n_nodes)))
         last_update = self.memory.last_update
 
-      ### Compute differences between the time the memory of a node was last updated,
-      ### and the time for which we want to compute the embedding of a node
       source_time_diffs = torch.LongTensor(edge_times).to(self.device) - last_update[
         source_nodes].long()
       source_time_diffs = (source_time_diffs - self.mean_time_shift_src) / self.std_time_shift_src
@@ -172,40 +156,53 @@ class TGN(torch.nn.Module):
       time_diffs = torch.cat([source_time_diffs, destination_time_diffs, negative_time_diffs],
                              dim=0)
 
-    # Compute the embeddings using the embedding module
+    # Compute base node embeddings (frozen backbone)
     node_embedding = self.embedding_module.compute_embedding(memory=memory,
                                                              source_nodes=nodes,
                                                              timestamps=timestamps,
                                                              n_layers=self.n_layers,
-                                                             n_neighbors=n_neighbors,
-                                                             struc_prompt=self.struc_prompt)
+                                                             n_neighbors=n_neighbors)
 
     source_node_embedding = node_embedding[:n_samples]
     destination_node_embedding = node_embedding[n_samples: 2 * n_samples]
     negative_node_embedding = node_embedding[2 * n_samples:]
 
+    if memory is not None:
+      his_prompt_src = self.history_prompt(
+          memory, source_nodes, edge_times,
+          self.neighbor_finder, self.memory
+      )
+      his_prompt_dst = self.history_prompt(
+          memory, destination_nodes, edge_times,
+          self.neighbor_finder, self.memory
+      )
+      his_prompt_neg = self.history_prompt(
+          memory, negative_nodes, edge_times,
+          self.neighbor_finder, self.memory
+      )
+      source_node_embedding = source_node_embedding + his_prompt_src
+      destination_node_embedding = destination_node_embedding + his_prompt_dst
+      negative_node_embedding = negative_node_embedding + his_prompt_neg
+
     if self.use_memory:
       if self.memory_update_at_start:
-        # Persist the updates to the memory only for sources and destinations (since now we have
-        # new messages for them)
         self.update_memory(positives, self.memory.messages)
-
         assert torch.allclose(memory[positives], self.memory.get_memory(positives), atol=1e-1), \
           "Something wrong in how the memory was updated"
-
-        # Remove messages for the positives since we have already updated the memory using them
         self.memory.clear_messages(positives)
 
       unique_sources, source_id_to_messages = self.get_raw_messages(source_nodes,
                                                                     source_node_embedding,
                                                                     destination_nodes,
                                                                     destination_node_embedding,
-                                                                    edge_times, edge_idxs)
+                                                                    edge_times, edge_idxs,
+                                                                    memory=memory)
       unique_destinations, destination_id_to_messages = self.get_raw_messages(destination_nodes,
                                                                               destination_node_embedding,
                                                                               source_nodes,
                                                                               source_node_embedding,
-                                                                              edge_times, edge_idxs)
+                                                                              edge_times, edge_idxs,
+                                                                              memory=memory)
       if self.memory_update_at_start:
         self.memory.store_raw_messages(unique_sources, source_id_to_messages)
         self.memory.store_raw_messages(unique_destinations, destination_id_to_messages)
@@ -217,28 +214,36 @@ class TGN(torch.nn.Module):
         source_node_embedding = memory[source_nodes]
         destination_node_embedding = memory[destination_nodes]
         negative_node_embedding = memory[negative_nodes]
-  
 
     return source_node_embedding, destination_node_embedding, negative_node_embedding
 
+  def _compute_topo_prompts_batched(self, source_nodes, destination_nodes, edge_times, memory):
+    B = len(source_nodes)
+
+    x_src = memory[source_nodes]  # (B, d)
+    x_dst = memory[destination_nodes]  # (B, d)
+
+    d_src = compute_node_degrees_at_time(
+        self.neighbor_finder, source_nodes, edge_times
+    ).to(self.device)  # (B, 1)
+    d_dst = compute_node_degrees_at_time(
+        self.neighbor_finder, destination_nodes, edge_times
+    ).to(self.device)  # (B, 1)
+
+    g_t = compute_graph_level_features(memory, self.n_nodes - 1)  # (d,)
+    max_ts = edge_times.max() if len(edge_times) > 0 else 0.0
+    d_bar = compute_avg_degree_at_time(self.neighbor_finder, self.n_nodes - 1, max_ts)
+
+    p_topo = self.topo_prompt(x_src, x_dst, d_src, d_dst, g_t, d_bar)
+    return p_topo
+
   def compute_edge_probabilities(self, source_nodes, destination_nodes, negative_nodes, edge_times,
                                  edge_idxs, n_neighbors=20):
-    """
-    Compute probabilities for edges between sources and destination and between sources and
-    negatives by first computing temporal embeddings using the TGN encoder and then feeding them
-    into the MLP decoder.
-    :param destination_nodes [batch_size]: destination ids
-    :param negative_nodes [batch_size]: ids of negative sampled destination
-    :param edge_times [batch_size]: timestamp of interaction
-    :param edge_idxs [batch_size]: index of interaction
-    :param n_neighbors [scalar]: number of temporal neighbor to consider in each convolutional
-    layer
-    :return: Probabilities for both the positive and negative edges
-    """
     n_samples = len(source_nodes)
 
-    source_node_embedding, destination_node_embedding, negative_node_embedding = self.compute_temporal_embeddings(
-      source_nodes, destination_nodes, negative_nodes, edge_times, edge_idxs, n_neighbors)
+    source_node_embedding, destination_node_embedding, negative_node_embedding = \
+        self.compute_temporal_embeddings(
+            source_nodes, destination_nodes, negative_nodes, edge_times, edge_idxs, n_neighbors)
 
     score = self.affinity_score(torch.cat([source_node_embedding, source_node_embedding], dim=0),
                                 torch.cat([destination_node_embedding,
@@ -248,83 +253,49 @@ class TGN(torch.nn.Module):
 
     return pos_score.sigmoid(), neg_score.sigmoid()
 
-  def update_memory(self, nodes, messages):
-    # Aggregate messages for the same nodes
-    unique_nodes, unique_messages, unique_timestamps = \
-      self.message_aggregator.aggregate(
-        nodes,
-        messages)
+  def compute_topo_loss(self, source_nodes, destination_nodes, negative_nodes,
+                        edge_times, memory):
+    """
+	Compute topology-aware loss.
+    """
+    if memory is None:
+      return torch.tensor(0.0, device=self.device)
 
-    if len(unique_nodes) > 0:
-      unique_messages = self.message_function.compute_message(unique_messages)
-
-    # Update the memory with the aggregated messages
-    self.memory_updater.update_memory(unique_nodes, unique_messages,
-                                      timestamps=unique_timestamps)
-
-  def get_updated_memory(self, nodes, messages):
-    # Aggregate messages for the same nodes
-    unique_nodes, unique_messages, unique_timestamps = \
-      self.message_aggregator.aggregate(
-        nodes,
-        messages)
-
-    if len(unique_nodes) > 0:
-      unique_messages = self.message_function.compute_message(unique_messages)
-
-    updated_memory, updated_last_update = self.memory_updater.get_updated_memory(unique_nodes,
-                                                                                 unique_messages,
-                                                                                 timestamps=unique_timestamps)
-
-    return updated_memory, updated_last_update
+    # Positive edge prompts
+    p_pos = self._compute_topo_prompts_batched(
+        source_nodes, destination_nodes, edge_times, memory
+    )
+    # Negative edge prompts
+    p_neg = self._compute_topo_prompts_batched(
+        source_nodes, negative_nodes, edge_times, memory
+    )
+    return self.topo_prompt.compute_topo_loss(p_pos, p_neg)
 
   def get_raw_messages(self, source_nodes, source_node_embedding, destination_nodes,
-                       destination_node_embedding, edge_times, edge_idxs):
+                       destination_node_embedding, edge_times, edge_idxs, memory=None):
     edge_times = torch.from_numpy(edge_times).float().to(self.device)
     edge_features = self.edge_raw_features[edge_idxs]
 
-    n_samples = len(source_nodes)
-    for i in range(n_samples):
-        u = source_nodes[i]
-        v = destination_nodes[i]
-        t1 = edge_times[i]
-        
-        t2 = t1 * self.t2_ratio
-        t3 = t1 * self.t3_ratio
-        
-        edge_prompt = self.edge_prompt_generator(
-            u, v, t1, t2, t3,
-            self.node_raw_features, self.edge_raw_features,
-            self.node_timestamps, self.edge_timestamps,
-            self.node_history, self.edge_history, self.node_features_time_varying
-        )
-        edge_features[i] = edge_features[i] * edge_prompt
-    
+    if memory is not None:
+      p_topo = self._compute_topo_prompts_batched(
+          source_nodes, destination_nodes, edge_times.cpu().numpy(), memory
+      )
+      edge_features = edge_features + p_topo  # Eq. 10: additive prompt
 
     source_memory = self.memory.get_memory(source_nodes) if not \
       self.use_source_embedding_in_message else source_node_embedding
     if not self.use_destination_embedding_in_message:
       destination_memory = self.memory.get_memory(destination_nodes)
     else:
-      # destination_memory = destination_node_embedding
-      # destination_memory = self.memory.get_memory(destination_nodes)
-      pass
-      
+      destination_memory = destination_node_embedding.detach()
 
     source_time_delta = edge_times - self.memory.last_update[source_nodes]
     source_time_delta_encoding = self.time_encoder(source_time_delta.unsqueeze(dim=1)).view(len(
       source_nodes), -1)
-    # source_time_delta_encoding  = self.time_prompt(source_time_delta_encoding)
-    if not self.use_destination_embedding_in_message:
-      source_message = torch.cat([source_memory, destination_memory, edge_features,
-                                  source_time_delta_encoding],
-                                dim=1)
-    else:
-      destination_memory = destination_node_embedding.detach()
-      source_message = torch.cat([source_memory, destination_memory, edge_features,
-                                  source_time_delta_encoding],
-                                dim=1)
-      
+
+    source_message = torch.cat([source_memory, destination_memory, edge_features,
+                                source_time_delta_encoding],
+                               dim=1)
     messages = defaultdict(list)
     unique_sources = np.unique(source_nodes)
 
@@ -332,6 +303,28 @@ class TGN(torch.nn.Module):
       messages[source_nodes[i]].append((source_message[i], edge_times[i]))
 
     return unique_sources, messages
+
+  def update_memory(self, nodes, messages):
+    unique_nodes, unique_messages, unique_timestamps = \
+      self.message_aggregator.aggregate(nodes, messages)
+
+    if len(unique_nodes) > 0:
+      unique_messages = self.message_function.compute_message(unique_messages)
+
+    self.memory_updater.update_memory(unique_nodes, unique_messages,
+                                      timestamps=unique_timestamps)
+
+  def get_updated_memory(self, nodes, messages):
+    unique_nodes, unique_messages, unique_timestamps = \
+      self.message_aggregator.aggregate(nodes, messages)
+
+    if len(unique_nodes) > 0:
+      unique_messages = self.message_function.compute_message(unique_messages)
+
+    updated_memory, updated_last_update = self.memory_updater.get_updated_memory(
+        unique_nodes, unique_messages, timestamps=unique_timestamps)
+
+    return updated_memory, updated_last_update
 
   def set_neighbor_finder(self, neighbor_finder):
     self.neighbor_finder = neighbor_finder

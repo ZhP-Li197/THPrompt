@@ -1,111 +1,156 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 
 
-class EdgePromptGenerator(nn.Module):
-    def __init__(self, node_feat_dim, edge_feat_dim, hidden_dim=64):
+class TopologyAwarePrompt(nn.Module):
+    def __init__(self, node_feat_dim, edge_feat_dim, rank=16,
+                 n_bases=8, local_hidden_dim=64):
         super().__init__()
-        self.node_aggregator = nn.Sequential(
-            nn.Linear(node_feat_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-        
-        self.edge_aggregator = nn.Sequential(
-            nn.Linear(edge_feat_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-
         self.node_feat_dim = node_feat_dim
         self.edge_feat_dim = edge_feat_dim
-        self.hidden_dim = hidden_dim
+        self.rank = rank
+        self.n_bases = n_bases
 
-        self.prompt_generator = nn.Linear(1, edge_feat_dim)
-        
-    def aggregate_features(self, features, aggregator, device):
-        if len(features) == 0:
-            return torch.zeros(self.hidden_dim, device=device)
-        
-        features = [f.to(device) for f in features]
-        return aggregator(torch.stack(features).mean(dim=0))
-        
-    def forward(self, u, v, t1, t2, t3, 
-                node_features, edge_features,
-                node_timestamps, edge_timestamps,
-                node_history, edge_history,node_time_varying):
-        device = node_features.device
+        # Low-rank factor matrices U, V ∈ R^{d×r}
+        self.U = nn.Parameter(torch.empty(node_feat_dim, rank))
+        self.V = nn.Parameter(torch.empty(node_feat_dim, rank))
+        nn.init.xavier_uniform_(self.U)
+        nn.init.xavier_uniform_(self.V)
 
-        if node_time_varying:
-            input_dim = 2 * (self.hidden_dim + self.hidden_dim)
-        else:
-            input_dim = 2 * (self.hidden_dim + self.node_feat_dim)
-        
-        if self.prompt_generator.in_features != input_dim:
-            self.prompt_generator = nn.Linear(input_dim, self.edge_feat_dim).to(device)
-        
-        if not node_time_varying:
-            u1 = node_features[u]
-        else:
-            u_ts = node_timestamps.get(u, [])
-            u_feat_indices = node_history.get(u, [])
-            valid_feats = []
-            for ts, idx in zip(u_ts, u_feat_indices):
-                if t2 <= ts <= t1:
-                    valid_feats.append(node_features[idx])
-            u1 = self.aggregate_features(valid_feats, self.node_aggregator, device)
+        # Local-to-global refinement
+        # r_local = [x_i ∥ x_j ∥ d_i ∥ d_j] → dim = 2*d + 2
+        local_input_dim = 2 * node_feat_dim + 2
+        self.local_mlp = nn.Sequential(
+            nn.Linear(local_input_dim, local_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(local_hidden_dim, local_hidden_dim),
+        )
+        self.W_G = nn.Linear(node_feat_dim + 1, local_hidden_dim, bias=False)
 
-        u_edge_ts = torch.tensor(edge_timestamps[u], device=t3.device)
-        u_edge_mask = (u_edge_ts >= t3) & (u_edge_ts <= t1)
-        u_edge_feats = edge_features[edge_history[u]][u_edge_mask]
-        u2 = self.aggregate_features(u_edge_feats, self.edge_aggregator, device)
-        
-        u3 = torch.cat([u1, u2], dim=0)       
+        # Hybrid fusion + basis decomposition
+        # s_topo = [s_LR ∥ s_LG], dim = rank + local_hidden_dim
+        topo_context_dim = rank + local_hidden_dim
+        self.topo_bases = nn.Parameter(torch.empty(n_bases, edge_feat_dim))
+        self.topo_attn_keys = nn.Parameter(torch.empty(n_bases, topo_context_dim))
+        nn.init.xavier_uniform_(self.topo_bases)
+        nn.init.xavier_uniform_(self.topo_attn_keys)
 
-        if not node_time_varying:
-            v1 = node_features[v]
-        else:
-            v_ts = node_timestamps.get(v, [])
-            v_feat_indices = node_history.get(v, [])
-            valid_feats = []
-            for ts, idx in zip(v_ts, v_feat_indices):
-                if t2 <= ts <= t1:
-                    valid_feats.append(node_features[idx])
-            
-            v1 = self.aggregate_features(valid_feats, self.node_aggregator, device)
-        
-        v_edge_ts = torch.tensor(edge_timestamps[v], device=t3.device)
-        v_edge_mask = (v_edge_ts >= t3) & (v_edge_ts <= t1)
-        v_edge_feats = edge_features[edge_history[v]][v_edge_mask]
-        v2 = self.aggregate_features(v_edge_feats, self.edge_aggregator, device)
-        
-        v3 = torch.cat([v1, v2], dim=0)
-        edge_prompt = self.prompt_generator(torch.cat([u3, v3], dim=0))
-        return edge_prompt
-    
+        self.score_mlp = nn.Sequential(
+            nn.Linear(edge_feat_dim, edge_feat_dim // 2),
+            nn.ReLU(),
+            nn.Linear(edge_feat_dim // 2, 1),
+        )
 
-class task_prompt_layer(nn.Module):
-    def __init__(self,input_dim):
-        super(task_prompt_layer, self).__init__()
-        self.weight= torch.nn.Parameter(torch.Tensor(1,input_dim))
-        self.max_n_num=input_dim
-        self.reset_parameters()
-    def reset_parameters(self):
-        torch.nn.init.xavier_uniform_(self.weight)
+    def forward(self, x_i, x_j, d_i, d_j, g_t, d_bar):
+        """
+	Batched topology-aware prompt generation.
+        """
+        B = x_i.size(0)
+        device = x_i.device
+
+        # --- Low-rank generative prior ---
+        u_i = x_i @ self.U  # (B, r)
+        v_j = x_j @ self.V  # (B, r)
+        s_lr = u_i * v_j     # (B, r) — element-wise (Hadamard)
+
+        # --- Local structural representation ---
+        r_local_ij = torch.cat([x_i, x_j, d_i, d_j], dim=1)  # (B, 2d+2)
+        r_local_ji = torch.cat([x_j, x_i, d_j, d_i], dim=1)  # (B, 2d+2)
+
+        # --- Global representation ---
+        d_bar_t = torch.tensor([d_bar], device=device, dtype=x_i.dtype)
+        r_global = torch.cat([g_t, d_bar_t], dim=0)  # (d+1,)
+
+        # --- Local-to-global refinement ---
+        s_lg = (self.local_mlp(r_local_ij)
+                + self.local_mlp(r_local_ji)
+                + self.W_G(r_global).unsqueeze(0))  # (B, local_hidden)
+
+        # --- Hybrid fusion via basis decomposition ---
+        s_topo = torch.cat([s_lr, s_lg], dim=1)  # (B, rank + local_hidden)
+        logits = s_topo @ self.topo_attn_keys.t()  # (B, K1)
+        alpha = F.softmax(logits, dim=1)           # (B, K1)
+        p_topo = alpha @ self.topo_bases            # (B, F_E)
+
+        return p_topo
+
+    def compute_topo_loss(self, p_pos, p_neg):
+        y_pos = torch.sigmoid(self.score_mlp(p_pos)).squeeze(-1)
+        y_neg = torch.sigmoid(self.score_mlp(p_neg)).squeeze(-1)
+        loss = (-torch.log(y_pos + 1e-8).sum()
+                - torch.log(1 - y_neg + 1e-8).sum())
+        return loss / (y_pos.size(0) + y_neg.size(0))
+
+
+class HistoryAwarePrompt(nn.Module):
+    def __init__(self, node_feat_dim, n_bases=8, n_neighbors=10, K=5):
+        super().__init__()
+        self.node_feat_dim = node_feat_dim
+        self.n_bases = n_bases
+        self.n_neighbors = n_neighbors
+        self.K = K
+
+        his_context_dim = 2 * node_feat_dim
+
+        self.his_bases = nn.Parameter(torch.empty(n_bases, node_feat_dim))
+        self.his_attn_keys = nn.Parameter(torch.empty(n_bases, his_context_dim))
+        nn.init.xavier_uniform_(self.his_bases)
+        nn.init.xavier_uniform_(self.his_attn_keys)
+
+    def forward(self, memory, source_nodes, timestamps, neighbor_finder,
+                memory_module=None):
+        B = len(source_nodes)
+        device = memory.device
+        d = memory.size(1)
+
+        # --- Self-history context ---
+        # Use current memory state as summary of self-history
+        x_self = memory[source_nodes]  # (B, d)
+
+        if memory_module is not None and hasattr(memory_module, 'messages'):
+            for idx, node_id in enumerate(source_nodes):
+                msgs = memory_module.messages.get(node_id, [])
+                if len(msgs) > 0:
+                    recent_msgs = msgs[-self.K:]
+                    msg_tensors = torch.stack([m[0] for m in recent_msgs])
+                    msg_mean = msg_tensors.mean(dim=0)
+                    if msg_mean.shape[0] == d:
+                        x_self[idx] = (x_self[idx] + msg_mean) / 2.0
+
+        # --- Neighborhood context ---
+        # Reuse neighbor_finder to get recent neighbors and their memory states
+        neighbors, _, _ = neighbor_finder.get_temporal_neighbor(
+            source_nodes, timestamps, n_neighbors=self.n_neighbors
+        )
+        neighbors_flat = neighbors.flatten()
+        neigh_memory = memory[neighbors_flat].view(B, self.n_neighbors, d)
+
+        neigh_mask = torch.from_numpy(neighbors).long().to(device) != 0  # (B, n_neighbors)
+        neigh_mask = neigh_mask.unsqueeze(-1).float()  # (B, n_neighbors, 1)
+        neigh_sum = (neigh_memory * neigh_mask).sum(dim=1)
+        neigh_count = neigh_mask.sum(dim=1).clamp(min=1)
+        x_neigh = neigh_sum / neigh_count  # (B, d) — mean pooling readout
+
+        # --- History-aware context ---
+        s_his = torch.cat([x_self, x_neigh], dim=1)  # (B, 2d)
+
+        # --- Basis decomposition ---
+        logits = s_his @ self.his_attn_keys.t()  # (B, K2)
+        beta = F.softmax(logits, dim=1)           # (B, K2)
+        q_his = beta @ self.his_bases              # (B, F_0)
+
+        return q_his
+
+
+class TaskPromptLayer(nn.Module):
+    """Task-specific element-wise scaling prompt."""
+
+    def __init__(self, input_dim):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(1, input_dim))
+        nn.init.xavier_uniform_(self.weight)
+
     def forward(self, node_embedding):
-        node_embedding=node_embedding*self.weight
-        return node_embedding
-
-
-class structure_prompt_layer(nn.Module):
-    def __init__(self,size,input_dim):
-        super(structure_prompt_layer, self).__init__()
-        self.weight= torch.nn.Parameter(torch.Tensor(size,input_dim))
-        self.max_n_num=input_dim
-        self.reset_parameters()
-    def reset_parameters(self):
-        torch.nn.init.xavier_uniform_(self.weight)
-    def forward(self ,id, node_embedding):
-        node_embedding=node_embedding + self.weight[id]
-        return node_embedding
+        return node_embedding * self.weight

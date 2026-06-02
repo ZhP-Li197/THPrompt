@@ -1,6 +1,7 @@
 # THPrompt
 
-We provide the code (in PyTorch) for our paper "Dual-Prompt Tuning for Spatial-Temporal Graphs".
+We provide the code (in PyTorch) for our paper "Efficient Prompt Tuning for Spatial-Temporal Graphs under
+Topology and History Shift".
 
 ## Usage
 

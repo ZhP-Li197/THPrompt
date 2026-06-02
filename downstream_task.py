@@ -74,73 +74,83 @@ for task in range(1):
         struc_prompt_tag=True,
         node_feat_dim=172,
         edge_feat_dim=172,
-        t2_ratio=0.8,
-        t3_ratio=0.8
+        rank=config.rank,
+        n_topo_bases=config.n_topo_bases,
+        n_his_bases=config.n_his_bases,
+        self_history_K=config.self_history_K,
+        topo_lambda=config.topo_lambda,
     )
-    
+
     criterion = torch.nn.BCELoss()
     tgn.load_state_dict(torch.load(MODEL_SAVE_PATH), strict=False)
     tgn.to(device)
 
+    # Optimizers: prompt parameters + affinity score (Eq. 20)
+    prompt_params = (
+        list(tgn.topo_prompt.parameters())
+        + list(tgn.history_prompt.parameters())
+        + list(tgn.task_prompt.parameters())
+    )
     optimizer = torch.optim.Adam(tgn.affinity_score.parameters(), lr=config.lr)
-    struc_prompt_optimizer = torch.optim.Adam(tgn.struc_prompt.parameters(), lr=0.01)
-    
+    prompt_optimizer = torch.optim.Adam(prompt_params, lr=0.01)
+
     for epoch in range(config.n_epoch):
         start_epoch_time = time.time()
-        
+
         if config.use_memory:
             tgn.memory.__init_memory__()
-        
+
         tgn.set_neighbor_finder(train_neighbor_finder)
-        
+
         optimizer.zero_grad()
-        struc_prompt_optimizer.zero_grad()
+        prompt_optimizer.zero_grad()
 
         sample_size = min(10, len(train_data.sources))
         train_indices = np.random.choice(len(train_data.sources), sample_size, replace=False)
-        
+
         sources_batch = train_data.sources[train_indices]
         destinations_batch = train_data.destinations[train_indices]
         edge_idxs_batch = train_data.edge_idxs[train_indices]
         timestamps_batch = train_data.timestamps[train_indices]
-        
+
         size = len(sources_batch)
         _, negatives_batch = train_rand_sampler.sample(size)
-        
+
         with torch.no_grad():
             pos_label = torch.ones(size, dtype=torch.float, device=device)
             neg_label = torch.zeros(size, dtype=torch.float, device=device)
-        
+
         tgn.train()
         pos_prob, neg_prob = tgn.compute_edge_probabilities(
             sources_batch, destinations_batch, negatives_batch,
             timestamps_batch, edge_idxs_batch, config.n_degree
         )
-        
-        src_prompt = tgn.struc_prompt.weight[sources_batch]
-        dst_prompt = tgn.struc_prompt.weight[destinations_batch]
-        pos_prompt_sim = torch.sum(src_prompt * dst_prompt, dim=1)
-        pos_prompt_prob = torch.sigmoid(pos_prompt_sim)
 
-        neg_dst = torch.randint(0, tgn.struc_prompt.weight.size(0), (size,), device=device)
-        neg_src_prompt = tgn.struc_prompt.weight[sources_batch]
-        neg_dst_prompt = tgn.struc_prompt.weight[neg_dst]
-        neg_prompt_sim = torch.sum(neg_src_prompt * neg_dst_prompt, dim=1)
-        neg_prompt_prob = torch.sigmoid(neg_prompt_sim)
+        # Task loss (Eq. 19 for link prediction)
+        task_loss = criterion(pos_prob.squeeze(), pos_label) + criterion(neg_prob.squeeze(), neg_label)
 
-        prompt_loss = 0.5 * criterion(pos_prompt_prob, pos_label) + 0.5 * criterion(neg_prompt_prob, neg_label)
-        total_loss = criterion(pos_prob.squeeze(), pos_label) + criterion(neg_prob.squeeze(), neg_label) + prompt_loss
+        # Topology-aware loss (Eq. 11, Eq. 20)
+        memory = None
+        if tgn.use_memory:
+            memory = tgn.memory.get_memory(list(range(tgn.n_nodes)))
+        topo_loss = tgn.compute_topo_loss(
+            sources_batch, destinations_batch, negatives_batch,
+            timestamps_batch, memory
+        )
+
+        # Eq. 20: L = l_task + lambda * l_topo
+        total_loss = task_loss + config.topo_lambda * topo_loss
         total_loss /= config.backprop_every
-        
+
         total_loss.backward()
         optimizer.step()
-        struc_prompt_optimizer.step()
-        
+        prompt_optimizer.step()
+
         if config.use_memory:
             tgn.memory.detach_memory()
 
         tgn.set_neighbor_finder(full_neighbor_finder)
-        
+
         train_memory_backup = None
         if config.use_memory:
             train_memory_backup = tgn.memory.backup_memory()
@@ -151,24 +161,26 @@ for task in range(1):
             data=val_data,
             n_neighbors=config.n_degree
         )
-        
+
         val_memory_backup = None
         if config.use_memory:
             val_memory_backup = tgn.memory.backup_memory()
             tgn.memory.restore_memory(train_memory_backup)
-        
+
         _, nn_val_auc = eval_edge_prediction(
             model=tgn,
             negative_edge_sampler=nn_val_rand_sampler,
             data=new_node_val_data,
             n_neighbors=config.n_degree
         )
-        
+
         if config.use_memory:
             tgn.memory.restore_memory(val_memory_backup)
-        
+
         epoch_duration = time.time() - start_epoch_time
-        print(f'Epoch: {epoch}, Time: {epoch_duration:.2f}s, Loss: {total_loss.item():.4f}')
+        print(f'Epoch: {epoch}, Time: {epoch_duration:.2f}s, '
+              f'Task Loss: {task_loss.item():.4f}, Topo Loss: {topo_loss.item():.4f}, '
+              f'Total Loss: {total_loss.item():.4f}')
         print(f'Val AUC: {val_auc:.4f}, New Node Val AUC: {nn_val_auc:.4f}')
 
     tgn.embedding_module.neighbor_finder = full_neighbor_finder
@@ -179,10 +191,10 @@ for task in range(1):
         n_neighbors=config.n_degree
     )
     test_aucs.append(test_auc)
-    
+
     if config.use_memory:
         tgn.memory.restore_memory(val_memory_backup)
-    
+
     _, nn_test_auc = eval_edge_prediction(
         model=tgn,
         negative_edge_sampler=nn_test_rand_sampler,
@@ -190,7 +202,7 @@ for task in range(1):
         n_neighbors=config.n_degree
     )
     test_nn_aucs.append(nn_test_auc)
-    
+
     print(f'\nTest statistics: Old nodes -- AUC: {test_auc:.4f}')
     print(f'Test statistics: New nodes -- AUC: {nn_test_auc:.4f}')
 
